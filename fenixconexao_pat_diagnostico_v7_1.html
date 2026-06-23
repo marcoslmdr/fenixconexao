@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>FenixConexão PAT Diagnóstico V7.1</title>
+<style>
+body{margin:0;background:#050711;color:#e5f6ff;font-family:Arial,Segoe UI,sans-serif}
+header{padding:20px;background:#0f172a;border-bottom:1px solid #1e293b}
+h1{margin:0;font-size:26px}.sub{color:#94a3b8;margin-top:5px}
+main{padding:20px;display:grid;grid-template-columns:390px 1fr;gap:18px}
+.card{background:#0b1224;border:1px solid #1e293b;border-radius:18px;padding:18px}
+label{display:block;color:#94a3b8;font-size:13px;margin:10px 0 6px}
+input,select,textarea{width:100%;box-sizing:border-box;background:#020617;color:#e5f6ff;border:1px solid #334155;border-radius:12px;padding:12px}
+button{margin-top:10px;width:100%;border:0;border-radius:12px;padding:13px;font-weight:800;cursor:pointer;background:#22d3ee;color:#06121c}
+button.gold{background:#f59e0b}button.red{background:#ef4444;color:white}
+.status{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.box{background:#020617;border:1px solid #334155;border-radius:14px;padding:14px}
+.box small{display:block;color:#94a3b8}.box b{font-size:20px}
+.terminal{height:480px;overflow:auto;background:#020617;border:1px solid #334155;border-radius:14px;padding:12px;font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap}
+.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fde68a}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+<h1>🔥 FenixConexão PAT Diagnóstico V7.1</h1>
+<div class="sub">Cole o PAT → Testar REST → Buscar contas → Gerar OTP → Conectar WebSocket</div>
+</header>
+<main>
+<section class="card">
+<h2>Configuração</h2>
+<label>Token PAT Deriv</label>
+<input id="token" type="password" placeholder="pat_...">
+<label>App ID</label>
+<input id="appId" value="1089">
+<label>Conta encontrada</label>
+<select id="accountSelect"><option value="">Nenhuma conta carregada</option></select>
+
+<button onclick="testHealth()">1. Testar API pública</button>
+<button onclick="loadAccounts()" class="gold">2. Buscar contas pelo token</button>
+<button onclick="connectOtp()" class="gold">3. Conectar via OTP</button>
+<button onclick="testPing()">4. Ping WebSocket</button>
+<button onclick="clearLog()" class="red">Limpar terminal</button>
+
+<div class="status">
+<div class="box"><small>Status</small><b id="status">Parado</b></div>
+<div class="box"><small>Saldo</small><b id="balance">--</b></div>
+<div class="box"><small>Conta</small><b id="account">--</b></div>
+<div class="box"><small>Moeda</small><b id="currency">--</b></div>
+</div>
+
+<h2>Teste público de ticks</h2>
+<label>Mercado</label>
+<select id="symbol">
+<option selected>R_50</option><option>R_10</option><option>R_25</option><option>R_75</option><option>R_100</option>
+<option>1HZ10V</option><option>1HZ25V</option><option>1HZ50V</option><option>1HZ75V</option><option>1HZ100V</option>
+</select>
+<button onclick="subscribeTicks()">Assinar ticks</button>
+</section>
+
+<section class="card">
+<h2>Terminal</h2>
+<div id="terminal" class="terminal"></div>
+</section>
+</main>
+
+<script>
+const API_BASE='https://api.derivws.com';
+let ws=null, accounts=[];
+const $=id=>document.getElementById(id);
+
+function now(){return new Date().toLocaleTimeString()}
+function log(msg,cls=''){const d=document.createElement('div');d.className=cls;d.textContent=now()+' • '+msg;$('terminal').prepend(d)}
+function clearLog(){$('terminal').innerHTML=''}
+function setStatus(s){$('status').textContent=s}
+function token(){return $('token').value.trim()}
+function appId(){return $('appId').value.trim()||'1089'}
+function headers(){return {'Authorization':'Bearer '+token(),'Deriv-App-ID':appId(),'Content-Type':'application/json','Accept':'application/json'}}
+function send(o){if(ws&&ws.readyState===1){ws.send(JSON.stringify(o));log('WS >> '+JSON.stringify(o),'warn')}else log('WebSocket não está aberto.','bad')}
+function safeJsonText(t){try{return JSON.stringify(JSON.parse(t),null,2)}catch(e){return t}}
+
+async function testHealth(){
+ setStatus('Testando API');
+ try{
+   const res=await fetch(API_BASE+'/v1/health',{method:'GET',headers:{'Deriv-App-ID':appId(),'Accept':'application/json'}});
+   const txt=await res.text();
+   log('HEALTH HTTP '+res.status+' '+res.statusText,'ok');
+   log(safeJsonText(txt));
+   setStatus(res.ok?'API OK':'API erro');
+ }catch(e){
+   log('Erro no teste público: '+e.message,'bad');
+   log('Se apareceu Failed to fetch, pode ser bloqueio de CORS/rede/navegador ao abrir arquivo local.','warn');
+   setStatus('Erro API');
+ }
+}
+
+function extractAccounts(data){
+ const arr = data?.data?.accounts || data?.accounts || data?.data || [];
+ return Array.isArray(arr) ? arr : [];
+}
+function accId(a){return a.account_id||a.accountId||a.id||a.loginid||a.login_id||a.identifier||a.account||a.uuid||''}
+
+async function loadAccounts(){
+ if(!token()){log('Cole o token PAT primeiro.','bad');return}
+ if(!token().startsWith('pat_')) log('Aviso: esse token não começa com pat_. Vou tentar mesmo assim.','warn');
+ setStatus('Buscando contas');
+ const url=API_BASE+'/trading/v1/options/accounts';
+ try{
+   log('REST GET '+url,'warn');
+   const res=await fetch(url,{method:'GET',headers:headers()});
+   const txt=await res.text();
+   log('ACCOUNTS HTTP '+res.status+' '+res.statusText, res.ok?'ok':'bad');
+   log(safeJsonText(txt));
+   let data={}; try{data=JSON.parse(txt)}catch(e){}
+   if(!res.ok){setStatus('Erro contas');return}
+   accounts=extractAccounts(data);
+   if(!accounts.length){
+     log('A resposta não trouxe lista de contas reconhecida. Veja o JSON acima.','bad');
+     setStatus('Sem contas');
+     return;
+   }
+   const sel=$('accountSelect'); sel.innerHTML='';
+   accounts.forEach((a,i)=>{
+     const id=accId(a)||('conta_'+i);
+     const cur=a.currency||a.currency_code||'';
+     const type=a.account_type||a.type||a.group||(a.is_virtual?'Demo':'');
+     const opt=document.createElement('option');
+     opt.value=id; opt.textContent=id+' • '+cur+' • '+type;
+     sel.appendChild(opt);
+   });
+   $('account').textContent=sel.value||'--';
+   log('Contas carregadas: '+accounts.length,'ok');
+   setStatus('Contas OK');
+ }catch(e){
+   log('Erro ao buscar contas: '+e.message,'bad');
+   log('Se for "Failed to fetch", teste abrir este HTML no Chrome/Edge em computador. Em alguns celulares o arquivo local bloqueia REST.','warn');
+   setStatus('Erro contas');
+ }
+}
+
+function getUrl(data){return data?.data?.url||data?.data?.websocket_url||data?.url||data?.websocket_url||data?.ws_url||data?.data?.ws_url||''}
+
+async function connectOtp(){
+ const accountId=$('accountSelect').value;
+ if(!token()){log('Cole o token PAT primeiro.','bad');return}
+ if(!accountId){log('Busque e selecione uma conta primeiro.','bad');return}
+ setStatus('Gerando OTP');
+ const url=API_BASE+'/trading/v1/options/accounts/'+encodeURIComponent(accountId)+'/otp';
+ try{
+   log('REST POST '+url,'warn');
+   const res=await fetch(url,{method:'POST',headers:headers()});
+   const txt=await res.text();
+   log('OTP HTTP '+res.status+' '+res.statusText, res.ok?'ok':'bad');
+   log(safeJsonText(txt));
+   let data={}; try{data=JSON.parse(txt)}catch(e){}
+   if(!res.ok){setStatus('Erro OTP');return}
+   const wsUrl=getUrl(data);
+   if(!wsUrl){log('Não achei data.url/websocket_url na resposta OTP.','bad');setStatus('Sem URL');return}
+   openWs(wsUrl,accountId);
+ }catch(e){
+   log('Erro OTP: '+e.message,'bad');
+   log('Se for "Failed to fetch", é bloqueio de REST/CORS/rede.','warn');
+   setStatus('Erro OTP');
+ }
+}
+
+function openWs(url,accountId){
+ if(ws)try{ws.close()}catch(e){}
+ setStatus('Abrindo WS');
+ log('Abrindo WebSocket: '+url.replace(/otp=.*/,'otp=***'),'warn');
+ ws=new WebSocket(url);
+ ws.onopen=()=>{setStatus('Conectado');$('account').textContent=accountId;log('WebSocket conectado via OTP.','ok');send({balance:1,subscribe:1})};
+ ws.onerror=()=>{log('Erro no WebSocket.','bad');setStatus('Erro WS')};
+ ws.onclose=()=>{log('WebSocket fechado.','warn');setStatus('Fechado')};
+ ws.onmessage=e=>handleWs(e.data);
+}
+
+function handleWs(txt){
+ log('WS << '+txt,'ok');
+ let r={}; try{r=JSON.parse(txt)}catch(e){return}
+ if(r.error){log('Erro WS API: '+(r.error.code||'')+' - '+r.error.message,'bad');return}
+ if(r.msg_type==='balance' && r.balance){
+   $('balance').textContent=Number(r.balance.balance).toFixed(2);
+   $('currency').textContent=r.balance.currency||'--';
+ }
+ if(r.msg_type==='tick' && r.tick){
+   setStatus('Tick '+r.tick.quote);
+ }
+ if(r.msg_type==='ping') log('Ping OK.','ok');
+}
+
+function testPing(){send({ping:1})}
+function subscribeTicks(){send({ticks:$('symbol').value,subscribe:1})}
+
+log('V7.1 carregado. Primeiro clique em "Testar API pública". Depois "Buscar contas".','ok');
+</script>
+</body>
+</html>
